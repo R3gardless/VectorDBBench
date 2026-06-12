@@ -57,7 +57,17 @@ class VectorChordTypedDict(CommonTypedDict):
         click.option(
             "--quantization-type",
             type=click.Choice(["vector", "halfvec", "rabitq8", "rabitq4"]),
-            help="Quantization type for vectors",
+            help="Quantization type used by the index",
+            default="vector",
+            show_default=True,
+        ),
+    ]
+    table_quantization_type: Annotated[
+        str | None,
+        click.option(
+            "--table-quantization-type",
+            type=click.Choice(["vector", "halfvec", "rabitq8", "rabitq4"]),
+            help="Quantization type the embeddings are stored as in the table",
             default="vector",
             show_default=True,
         ),
@@ -168,6 +178,7 @@ def VectorChordRQ(
         ),
         db_case_config=VectorChordRQConfig(
             quantization_type=parameters["quantization_type"],
+            table_quantization_type=parameters["table_quantization_type"],
             lists=parameters["lists"],
             probes=parameters["probes"],
             epsilon=parameters["epsilon"],
@@ -255,6 +266,7 @@ def VectorChordGraph(
         ),
         db_case_config=VectorChordGraphConfig(
             quantization_type=parameters["quantization_type"],
+            table_quantization_type=parameters["table_quantization_type"],
             m=parameters["m"],
             ef_construction=parameters["ef_construction"],
             bits=parameters["bits"],

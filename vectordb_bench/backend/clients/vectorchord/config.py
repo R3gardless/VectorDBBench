@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from typing import Literal, LiteralString, TypedDict
 
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, SecretStr, model_validator
 
 from ..api import DBCaseConfig, DBConfig, IndexType, MetricType
 
@@ -64,7 +64,17 @@ class VectorChordIndexConfig(BaseModel, DBCaseConfig):
     metric_type: MetricType | None = None
     create_index_before_load: bool = False
     create_index_after_load: bool = True
+    # quantization applied by the index; rabitq types are quantized via quantize_to_rabitq*()
     quantization_type: Literal["vector", "halfvec", "rabitq8", "rabitq4"] = "vector"
+    # column type the embeddings are stored as in the table
+    table_quantization_type: Literal["vector", "halfvec", "rabitq8", "rabitq4"] = "vector"
+
+    @model_validator(mode="after")
+    def _sync_quantization_types(self):
+        # a rabitq column can only be indexed with its own operator class
+        if self.table_quantization_type in ("rabitq8", "rabitq4"):
+            self.quantization_type = self.table_quantization_type
+        return self
 
     def parse_metric(self) -> str:
         ops = _METRIC_OPS.get(self.quantization_type, _METRIC_OPS["vector"])
@@ -124,6 +134,7 @@ class VectorChordRQConfig(VectorChordIndexConfig):
             "metric": self.parse_metric(),
             "index_type": self.index.value,
             "quantization_type": self.quantization_type,
+            "table_quantization_type": self.table_quantization_type,
             "options": "\n".join(options_parts),
             "max_parallel_workers": self.max_parallel_workers,
         }
@@ -170,6 +181,7 @@ class VectorChordGraphConfig(VectorChordIndexConfig):
             "metric": self.parse_metric(),
             "index_type": self.index.value,
             "quantization_type": self.quantization_type,
+            "table_quantization_type": self.table_quantization_type,
             "options": "\n".join(options_parts),
             "max_parallel_workers": self.max_parallel_workers,
         }

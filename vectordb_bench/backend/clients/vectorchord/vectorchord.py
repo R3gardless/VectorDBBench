@@ -53,7 +53,9 @@ class VectorChord(VectorDB):
 
         index_param = self.case_config.index_param()
         self._quantization_type = index_param["quantization_type"]
+        self._table_quantization_type = index_param["table_quantization_type"]
         self._index_method = index_param["index_type"]
+        self._staging_table_name = "vectorchord_rabitq_staging"
 
         self.conn, self.cursor = self._create_connection(**self.db_config)
 
@@ -186,6 +188,25 @@ class VectorChord(VectorDB):
         results.extend(self.cursor.execute(sql.SQL("SHOW max_parallel_maintenance_workers;")).fetchall())
         log.info(f"{self.name} parallel index creation parameters: {results}")
 
+    def _embedding_expr(self) -> str:
+        """SQL expression the index is built on. The search query must use the exact
+        same expression for the planner to match the expression index."""
+        quant = self._quantization_type
+        if quant == self._table_quantization_type:
+            return "embedding"
+        if quant in ("rabitq8", "rabitq4"):
+            # no vector/halfvec -> rabitq cast exists; quantize_to_rabitq* is the documented path
+            return f"quantize_to_{quant}(embedding)::{quant}({self.dim})"
+        return f"embedding::{quant}({self.dim})"
+
+    def _query_operand(self) -> str:
+        quant = self._quantization_type
+        if quant in ("rabitq8", "rabitq4"):
+            return f"quantize_to_{quant}(%s::vector)"
+        if quant == self._table_quantization_type:
+            return f"%s::{quant}"
+        return f"%s::{quant}({self.dim})"
+
     def _create_index(self):
         assert self.conn is not None, "Connection is not initialized"
         assert self.cursor is not None, "Cursor is not initialized"
@@ -197,12 +218,13 @@ class VectorChord(VectorDB):
         index_create_sql = sql.SQL(
             """
             CREATE INDEX IF NOT EXISTS {index_name} ON public.{table_name}
-            USING {index_method} (embedding {embedding_metric})
+            USING {index_method} (({embedding_expr}) {embedding_metric})
             """,
         ).format(
             index_name=sql.Identifier(self._index_name),
             table_name=sql.Identifier(self.table_name),
             index_method=sql.SQL(self._index_method),
+            embedding_expr=sql.SQL(self._embedding_expr()),
             embedding_metric=sql.Identifier(index_param["metric"]),
         )
 
@@ -226,10 +248,7 @@ class VectorChord(VectorDB):
         try:
             log.info(f"{self.name} client create table : {self.table_name}")
 
-            col_type = self._quantization_type
-            if col_type in ("rabitq8", "rabitq4"):
-                # rabitq types need vector column + quantization during insert
-                col_type = "vector"
+            col_type = self._table_quantization_type
 
             self.cursor.execute(
                 sql.SQL(
@@ -259,7 +278,9 @@ class VectorChord(VectorDB):
             metadata_arr = np.array(metadata)
             embeddings_arr = np.array(embeddings)
 
-            if self._quantization_type == "halfvec":
+            if self._table_quantization_type in ("rabitq8", "rabitq4"):
+                self._insert_quantized(metadata_arr, embeddings_arr)
+            elif self._table_quantization_type == "halfvec":
                 with self.cursor.copy(
                     sql.SQL("COPY public.{table_name} FROM STDIN (FORMAT BINARY)").format(
                         table_name=sql.Identifier(self.table_name),
@@ -269,7 +290,6 @@ class VectorChord(VectorDB):
                     for i, row in enumerate(metadata_arr):
                         copy.write_row((row, np.float16(embeddings_arr[i])))
             else:
-                # vector, rabitq8, rabitq4 all store as vector column
                 with self.cursor.copy(
                     sql.SQL("COPY public.{table_name} FROM STDIN (FORMAT BINARY)").format(
                         table_name=sql.Identifier(self.table_name),
@@ -285,17 +305,47 @@ class VectorChord(VectorDB):
             log.warning(f"Failed to insert data into vectorchord table ({self.table_name}), error: {e}")
             return 0, e
 
+    def _insert_quantized(self, metadata_arr: np.ndarray, embeddings_arr: np.ndarray):
+        """COPY cannot produce rabitq encodings, so stage the batch as vector
+        and quantize server-side with quantize_to_rabitq8/quantize_to_rabitq4."""
+        self.cursor.execute(
+            sql.SQL("CREATE TEMP TABLE IF NOT EXISTS {staging} (id BIGINT, embedding vector({dim}));").format(
+                staging=sql.Identifier(self._staging_table_name),
+                dim=self.dim,
+            ),
+        )
+        with self.cursor.copy(
+            sql.SQL("COPY {staging} FROM STDIN (FORMAT BINARY)").format(
+                staging=sql.Identifier(self._staging_table_name),
+            ),
+        ) as copy:
+            copy.set_types(["bigint", "vector"])
+            for i, row in enumerate(metadata_arr):
+                copy.write_row((row, embeddings_arr[i]))
+        self.cursor.execute(
+            sql.SQL(
+                "INSERT INTO public.{table_name} (id, embedding) "
+                "SELECT id, {quantize_fn}(embedding) FROM {staging};",
+            ).format(
+                table_name=sql.Identifier(self.table_name),
+                quantize_fn=sql.SQL(f"quantize_to_{self._table_quantization_type}"),
+                staging=sql.Identifier(self._staging_table_name),
+            ),
+        )
+        self.cursor.execute(
+            sql.SQL("TRUNCATE {staging};").format(staging=sql.Identifier(self._staging_table_name)),
+        )
+
     def _generate_search_query(self) -> sql.Composed:
-        # Search query cast type: rabitq8/rabitq4 queries still accept ::vector input
-        cast_type = "vector"
         return sql.Composed(
             [
-                sql.SQL("SELECT id FROM public.{table_name} {where_clause} ORDER BY embedding ").format(
+                sql.SQL("SELECT id FROM public.{table_name} {where_clause} ORDER BY {embedding_expr} ").format(
                     table_name=sql.Identifier(self.table_name),
                     where_clause=sql.SQL(self.where_clause),
+                    embedding_expr=sql.SQL(self._embedding_expr()),
                 ),
                 sql.SQL(self.case_config.search_param()["metric_fun_op"]),
-                sql.SQL(f" %s::{cast_type} LIMIT %s::int"),
+                sql.SQL(f" {self._query_operand()} LIMIT %s::int"),
             ],
         )
 
